@@ -1,0 +1,47 @@
+# Скомпилированные бинарники
+tunguzka
+tunguzka_p54c
+tunguzka_mmx
+tunguzka_3dnow
+dist_3dnow/
+
+# Артефакты сборки под DOS / Windows / Linux
+*.exe
+*.com
+*.out
+*.o
+*.obj
+*.elf
+*.map
+*.pdb
+
+# Дампы контекста LLM / анализаторов
+repomix-output*.xml
+repomix.config.json
+
+# Модели и веса: игнорируем всё...
+*.mmx
+*.retromodel
+
+# ...НО сохраняем тестовые наборы весов:
+!test_*.mmx
+
+# Токенизаторы: игнорируем все тяжелые бинарники словарей...
+*.bin
+
+# ...НО сохраняем легкие тестовые токенизаторы (если они нужны):
+!test_dummy_tok.bin
+
+# Python окружение и кэш
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Служебные файлы ОС и редакторов
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
