@@ -482,11 +482,12 @@ int tunguzka_load_from_offset(TunguzkaModel *model, const char *file_path, size_
         return -1;
     }
 
-    uint32_t head_size  = dim / n_heads;
-    uint32_t half_head  = head_size / 2;
-    uint32_t kv_dim     = (dim * n_kv_heads) / n_heads;
-    uint32_t max_dim    = (hidden_dim > dim) ? hidden_dim : dim;
-    uint32_t max_groups = max_dim / group_size;
+    uint32_t head_size    = dim / n_heads;
+    uint32_t half_head    = head_size / 2;
+    uint32_t kv_dim       = (dim * n_kv_heads) / n_heads;
+    uint32_t max_dim      = (hidden_dim > dim) ? hidden_dim : dim;
+    uint32_t max_groups   = max_dim / group_size;
+    uint32_t max_x_scales = (n_heads > max_groups) ? n_heads : max_groups;
 
     if ((kv_dim % group_size) != 0) {
         fclose(f);
@@ -504,7 +505,7 @@ int tunguzka_load_from_offset(TunguzkaModel *model, const char *file_path, size_
     size_t base_arena_bytes = 0;
     base_arena_bytes += 7 * (size_t)n_layers * sizeof(QuantizedTensor) + 1024;
     base_arena_bytes += (3 * (size_t)dim + 2 * (size_t)hidden_dim + dim + 2 * kv_dim + seq_len + vocab_size + 3 * half_head) * sizeof(float);
-    base_arena_bytes += max_dim * sizeof(int8_t) + max_dim * sizeof(int16_t) + max_groups * sizeof(float);
+    base_arena_bytes += max_dim * sizeof(int8_t) + max_dim * sizeof(int16_t) + max_x_scales * sizeof(float);
     base_arena_bytes += (size_t)TUNGUZKA_MMX_TILE_R * max_groups * sizeof(int32_t);
     if (use_kv8) {
         base_arena_bytes += 2 * kv_entries * sizeof(int8_t) + 2 * kv_scale_entries * sizeof(float);
@@ -599,7 +600,7 @@ int tunguzka_load_from_offset(TunguzkaModel *model, const char *file_path, size_
     s->hb2           = (float *)arena_alloc_aligned(&model->arena, hidden_dim * sizeof(float), TUNGUZKA_ALIGN);
     s->xq            = (int8_t *)arena_alloc_aligned(&model->arena, max_dim * sizeof(int8_t), TUNGUZKA_ALIGN);
     s->xq16          = (int16_t *)arena_alloc_aligned(&model->arena, max_dim * sizeof(int16_t), TUNGUZKA_ALIGN);
-    s->x_scales      = (float *)arena_alloc_aligned(&model->arena, max_groups * sizeof(float), TUNGUZKA_ALIGN);
+    s->x_scales      = (float *)arena_alloc_aligned(&model->arena, max_x_scales * sizeof(float), TUNGUZKA_ALIGN);
     s->acc_buf       = (int32_t *)arena_alloc_aligned(&model->arena, (size_t)TUNGUZKA_MMX_TILE_R * max_groups * sizeof(int32_t), TUNGUZKA_ALIGN);
     s->rope_inv_freq = (float *)arena_alloc_aligned(&model->arena, half_head * sizeof(float), TUNGUZKA_ALIGN);
     s->rope_cos      = (float *)arena_alloc_aligned(&model->arena, half_head * sizeof(float), TUNGUZKA_ALIGN);
@@ -757,6 +758,162 @@ int tunguzka_load_from_offset(TunguzkaModel *model, const char *file_path, size_
     return 0;
 }
 
+int tunguzka_reconfigure(TunguzkaModel *model, uint32_t new_max_seq, int new_use_kv8) {
+    if (!model || model->stream_mode || !model->weights_mem) return -1;
+
+    uint32_t target_seq = model->orig_max_seq_len;
+    if (new_max_seq > 0 && new_max_seq < target_seq) {
+        target_seq = new_max_seq;
+    }
+    if (target_seq == 0 || target_seq > 32768) return -1;
+
+    uint32_t dim        = model->config.dim;
+    uint32_t hidden_dim = model->config.hidden_dim;
+    uint32_t n_layers   = model->config.n_layers;
+    uint32_t n_heads    = model->config.n_heads;
+    uint32_t n_kv_heads = model->config.n_kv_heads;
+    uint32_t vocab_size = model->config.vocab_size;
+    uint32_t group_size = model->config.group_size;
+    uint8_t  ktype      = model->config.kernel_type;
+    uint8_t  emb_ktype  = get_emb_wcls_ktype(&model->config);
+    int      has_sub_w  = (model->config.flags & MODEL_FLAG_HAS_SUBNORM_WEIGHTS) != 0;
+    int      layer_maj  = (model->config.flags & MODEL_FLAG_LAYER_MAJOR) != 0 || (model->config.version >= 2);
+
+    uint32_t head_size    = dim / n_heads;
+    uint32_t half_head    = head_size / 2;
+    uint32_t kv_dim       = (dim * n_kv_heads) / n_heads;
+    uint32_t max_dim      = (hidden_dim > dim) ? hidden_dim : dim;
+    uint32_t max_groups   = max_dim / group_size;
+    uint32_t max_x_scales = (n_heads > max_groups) ? n_heads : max_groups;
+
+    size_t kv_entries = (size_t)n_layers * target_seq * kv_dim;
+    size_t kv_scale_entries = (size_t)n_layers * target_seq * n_kv_heads;
+    size_t rms_floats = (size_t)2 * n_layers * dim + dim;
+    if (has_sub_w) {
+        rms_floats += (size_t)n_layers * dim + (size_t)n_layers * hidden_dim;
+    }
+    size_t rms_bytes = rms_floats * sizeof(float);
+
+    size_t base_arena_bytes = 0;
+    base_arena_bytes += 7 * (size_t)n_layers * sizeof(QuantizedTensor) + 1024;
+    base_arena_bytes += (3 * (size_t)dim + 2 * (size_t)hidden_dim + dim + 2 * kv_dim + target_seq + vocab_size + 3 * half_head) * sizeof(float);
+    base_arena_bytes += max_dim * sizeof(int8_t) + max_dim * sizeof(int16_t) + max_x_scales * sizeof(float);
+    base_arena_bytes += (size_t)TUNGUZKA_MMX_TILE_R * max_groups * sizeof(int32_t);
+    if (new_use_kv8) {
+        base_arena_bytes += 2 * kv_entries * sizeof(int8_t) + 2 * kv_scale_entries * sizeof(float);
+    } else {
+        base_arena_bytes += 2 * kv_entries * sizeof(float);
+    }
+    base_arena_bytes += 2048;
+
+    MemoryArena new_arena;
+    if (arena_init(&new_arena, base_arena_bytes) != 0) {
+        return -1;
+    }
+
+    arena_free(&model->arena);
+    model->arena = new_arena;
+    model->config.max_seq_len = target_seq;
+    model->use_kv8 = new_use_kv8 ? 1 : 0;
+    memset(&model->state, 0, sizeof(RunState));
+
+    TransformerWeights *w = &model->weights;
+    w->wq = (QuantizedTensor *)arena_alloc_aligned(&model->arena, n_layers * sizeof(QuantizedTensor), TUNGUZKA_ALIGN);
+    w->wk = (QuantizedTensor *)arena_alloc_aligned(&model->arena, n_layers * sizeof(QuantizedTensor), TUNGUZKA_ALIGN);
+    w->wv = (QuantizedTensor *)arena_alloc_aligned(&model->arena, n_layers * sizeof(QuantizedTensor), TUNGUZKA_ALIGN);
+    w->wo = (QuantizedTensor *)arena_alloc_aligned(&model->arena, n_layers * sizeof(QuantizedTensor), TUNGUZKA_ALIGN);
+    w->w1 = (QuantizedTensor *)arena_alloc_aligned(&model->arena, n_layers * sizeof(QuantizedTensor), TUNGUZKA_ALIGN);
+    w->w2 = (QuantizedTensor *)arena_alloc_aligned(&model->arena, n_layers * sizeof(QuantizedTensor), TUNGUZKA_ALIGN);
+    w->w3 = (QuantizedTensor *)arena_alloc_aligned(&model->arena, n_layers * sizeof(QuantizedTensor), TUNGUZKA_ALIGN);
+
+    RunState *s = &model->state;
+    s->x             = (float *)arena_alloc_aligned(&model->arena, dim * sizeof(float), TUNGUZKA_ALIGN);
+    s->xb            = (float *)arena_alloc_aligned(&model->arena, dim * sizeof(float), TUNGUZKA_ALIGN);
+    s->xb2           = (float *)arena_alloc_aligned(&model->arena, dim * sizeof(float), TUNGUZKA_ALIGN);
+    s->hb            = (float *)arena_alloc_aligned(&model->arena, hidden_dim * sizeof(float), TUNGUZKA_ALIGN);
+    s->hb2           = (float *)arena_alloc_aligned(&model->arena, hidden_dim * sizeof(float), TUNGUZKA_ALIGN);
+    s->xq            = (int8_t *)arena_alloc_aligned(&model->arena, max_dim * sizeof(int8_t), TUNGUZKA_ALIGN);
+    s->xq16          = (int16_t *)arena_alloc_aligned(&model->arena, max_dim * sizeof(int16_t), TUNGUZKA_ALIGN);
+    s->x_scales      = (float *)arena_alloc_aligned(&model->arena, max_x_scales * sizeof(float), TUNGUZKA_ALIGN);
+    s->acc_buf       = (int32_t *)arena_alloc_aligned(&model->arena, (size_t)TUNGUZKA_MMX_TILE_R * max_groups * sizeof(int32_t), TUNGUZKA_ALIGN);
+    s->rope_inv_freq = (float *)arena_alloc_aligned(&model->arena, half_head * sizeof(float), TUNGUZKA_ALIGN);
+    s->rope_cos      = (float *)arena_alloc_aligned(&model->arena, half_head * sizeof(float), TUNGUZKA_ALIGN);
+    s->rope_sin      = (float *)arena_alloc_aligned(&model->arena, half_head * sizeof(float), TUNGUZKA_ALIGN);
+    s->q             = (float *)arena_alloc_aligned(&model->arena, dim * sizeof(float), TUNGUZKA_ALIGN);
+    s->att           = (float *)arena_alloc_aligned(&model->arena, target_seq * sizeof(float), TUNGUZKA_ALIGN);
+    s->logits        = (float *)arena_alloc_aligned(&model->arena, vocab_size * sizeof(float), TUNGUZKA_ALIGN);
+
+    if (new_use_kv8) {
+        s->k              = (float *)arena_alloc_aligned(&model->arena, kv_dim * sizeof(float), TUNGUZKA_ALIGN);
+        s->v              = (float *)arena_alloc_aligned(&model->arena, kv_dim * sizeof(float), TUNGUZKA_ALIGN);
+        s->key_cache_q8   = (int8_t *)arena_alloc_aligned(&model->arena, kv_entries * sizeof(int8_t), TUNGUZKA_ALIGN);
+        s->value_cache_q8 = (int8_t *)arena_alloc_aligned(&model->arena, kv_entries * sizeof(int8_t), TUNGUZKA_ALIGN);
+        s->key_scales     = (float *)arena_alloc_aligned(&model->arena, kv_scale_entries * sizeof(float), TUNGUZKA_ALIGN);
+        s->value_scales   = (float *)arena_alloc_aligned(&model->arena, kv_scale_entries * sizeof(float), TUNGUZKA_ALIGN);
+    } else {
+        s->key_cache   = (float *)arena_alloc_aligned(&model->arena, kv_entries * sizeof(float), TUNGUZKA_ALIGN);
+        s->value_cache = (float *)arena_alloc_aligned(&model->arena, kv_entries * sizeof(float), TUNGUZKA_ALIGN);
+    }
+
+    float log_theta = (model->rope_theta > 100000.0f) ? 13.122363377404328f : 9.210340371976184f;
+    float scale_factor = (dim <= 3072) ? 32.0f : 8.0f;
+    for (uint32_t hd = 0, idx = 0; hd < head_size; hd += 2, idx++) {
+        float freq = tz_expf(-(float)hd * (log_theta / (float)head_size));
+        if (model->rope_scaled && freq > 0.0f) {
+            float wavelen = 6.283185307179586f / freq;
+            if (wavelen > 8192.0f) {
+                freq /= scale_factor;
+            } else if (wavelen > 2048.0f) {
+                float smooth = (8192.0f / wavelen - 1.0f) * (1.0f / 3.0f);
+                freq = (1.0f - smooth) * (freq / scale_factor) + smooth * freq;
+            }
+        }
+        s->rope_inv_freq[idx] = freq;
+    }
+
+    const uint8_t *base = (const uint8_t *)model->weights_mem;
+    size_t offset = sizeof(TunguzkaHeader);
+    const float *rms_ptr = (const float *)(base + offset);
+
+    w->rms_att_weight   = rms_ptr; rms_ptr += (size_t)n_layers * dim;
+    w->rms_ffn_weight   = rms_ptr; rms_ptr += (size_t)n_layers * dim;
+    w->rms_final_weight = rms_ptr; rms_ptr += (size_t)dim;
+    if (has_sub_w) {
+        w->rms_sub_att_weight = rms_ptr; rms_ptr += (size_t)n_layers * dim;
+        w->rms_sub_ffn_weight = rms_ptr; rms_ptr += (size_t)n_layers * hidden_dim;
+    }
+    offset = align_up(offset + rms_bytes, TUNGUZKA_ALIGN);
+
+    bind_quantized_tensor(&w->token_embedding_table, base, &offset, model->weights_size, vocab_size, dim, group_size, emb_ktype);
+    if (layer_maj) {
+        for (uint32_t l = 0; l < n_layers; l++) {
+            bind_quantized_tensor(&w->wq[l], base, &offset, model->weights_size, dim, dim, group_size, ktype);
+            bind_quantized_tensor(&w->wk[l], base, &offset, model->weights_size, kv_dim, dim, group_size, ktype);
+            bind_quantized_tensor(&w->wv[l], base, &offset, model->weights_size, kv_dim, dim, group_size, ktype);
+            bind_quantized_tensor(&w->wo[l], base, &offset, model->weights_size, dim, dim, group_size, ktype);
+            bind_quantized_tensor(&w->w1[l], base, &offset, model->weights_size, hidden_dim, dim, group_size, ktype);
+            bind_quantized_tensor(&w->w3[l], base, &offset, model->weights_size, hidden_dim, dim, group_size, ktype);
+            bind_quantized_tensor(&w->w2[l], base, &offset, model->weights_size, dim, hidden_dim, group_size, ktype);
+        }
+    } else {
+        for (uint32_t l = 0; l < n_layers; l++) bind_quantized_tensor(&w->wq[l], base, &offset, model->weights_size, dim, dim, group_size, ktype);
+        for (uint32_t l = 0; l < n_layers; l++) bind_quantized_tensor(&w->wk[l], base, &offset, model->weights_size, kv_dim, dim, group_size, ktype);
+        for (uint32_t l = 0; l < n_layers; l++) bind_quantized_tensor(&w->wv[l], base, &offset, model->weights_size, kv_dim, dim, group_size, ktype);
+        for (uint32_t l = 0; l < n_layers; l++) bind_quantized_tensor(&w->wo[l], base, &offset, model->weights_size, dim, dim, group_size, ktype);
+        for (uint32_t l = 0; l < n_layers; l++) bind_quantized_tensor(&w->w1[l], base, &offset, model->weights_size, hidden_dim, dim, group_size, ktype);
+        for (uint32_t l = 0; l < n_layers; l++) bind_quantized_tensor(&w->w2[l], base, &offset, model->weights_size, dim, hidden_dim, group_size, ktype);
+        for (uint32_t l = 0; l < n_layers; l++) bind_quantized_tensor(&w->w3[l], base, &offset, model->weights_size, hidden_dim, dim, group_size, ktype);
+    }
+
+    if ((model->config.flags & MODEL_FLAG_SHARED_CLASSIFIER) != 0) {
+        w->wcls = w->token_embedding_table;
+    } else {
+        bind_quantized_tensor(&w->wcls, base, &offset, model->weights_size, vocab_size, dim, group_size, emb_ktype);
+    }
+
+    return 0;
+}
+
 int tunguzka_shift_kv_cache(TunguzkaModel *model, int cur_pos, int shift) {
     TunguzkaHeader *c = &model->config;
     RunState *s = &model->state;
@@ -828,7 +985,7 @@ static void subnorm_unit_inplace(float *x, uint32_t size, float eps) {
     for (uint32_t j = 0; j < size; j++) x[j] *= ss;
 }
 
-float *tunguzka_forward(TunguzkaModel *model, int token, int pos) {
+float *tunguzka_forward_ex(TunguzkaModel *model, int token, int pos, int compute_logits) {
     TunguzkaHeader *c = &model->config;
     TransformerWeights *w = &model->weights;
     RunState *s = &model->state;
@@ -1006,6 +1163,10 @@ float *tunguzka_forward(TunguzkaModel *model, int token, int pos) {
         for (uint32_t i = 0; i < dim; i++) s->x[i] += s->xb[i];
     }
 
+    if (!compute_logits) {
+        return s->logits;
+    }
+
     if (model->backend == BACKEND_3DNOW) {
         rmsnorm_3dnow(s->xb, s->x, w->rms_final_weight, dim, eps);
     } else {
@@ -1015,6 +1176,10 @@ float *tunguzka_forward(TunguzkaModel *model, int token, int pos) {
     prepare_activations(s->xb, s->xq, s->xq16, s->x_scales, dim, group_size, model->backend);
     matmul_model_tensor_ex(model, s->logits, &w->wcls, emb_ktype, (int32_t)n_layers);
     return s->logits;
+}
+
+float *tunguzka_forward(TunguzkaModel *model, int token, int pos) {
+    return tunguzka_forward_ex(model, token, pos, 1);
 }
 
 void tunguzka_free(TunguzkaModel *model) {

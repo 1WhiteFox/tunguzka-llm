@@ -362,14 +362,14 @@ void tui_flip(TuiEngine *tui) {
 #if defined(_WIN32)
     CHAR_INFO win_buf[TUI_ROWS * TUI_COLS];
     COORD buf_size = { TUI_COLS, TUI_ROWS };
-    COORD buf_coord = { 0, 0 };
-    SMALL_RECT write_region = { 0, 0, TUI_COLS - 1, TUI_ROWS - 1 };
-    int changed = 0;
+    int min_y = TUI_ROWS;
+    int max_y = -1;
     for (int y = 0; y < TUI_ROWS; y++) {
         for (int x = 0; x < TUI_COLS; x++) {
             if (tui->backbuffer[y][x].ch != tui->frontbuffer[y][x].ch ||
                 tui->backbuffer[y][x].attr != tui->frontbuffer[y][x].attr) {
-                changed = 1;
+                if (y < min_y) min_y = y;
+                if (y > max_y) max_y = y;
             }
             int idx = y * TUI_COLS + x;
             win_buf[idx].Char.AsciiChar = (char)tui->backbuffer[y][x].ch;
@@ -377,42 +377,61 @@ void tui_flip(TuiEngine *tui) {
             tui->frontbuffer[y][x] = tui->backbuffer[y][x];
         }
     }
-    if (changed && g_hStdout != INVALID_HANDLE_VALUE) {
+    if (max_y >= min_y && g_hStdout != INVALID_HANDLE_VALUE) {
+        COORD buf_coord = { 0, (SHORT)min_y };
+        SMALL_RECT write_region = { 0, (SHORT)min_y, TUI_COLS - 1, (SHORT)max_y };
         WriteConsoleOutputA(g_hStdout, win_buf, buf_size, buf_coord, &write_region);
     }
 #elif defined(__DJGPP__)
+    _farsetsel(DOS_SCREEN_SEG);
     for (int y = 0; y < TUI_ROWS; y++) {
         for (int x = 0; x < TUI_COLS; x++) {
             if (tui->backbuffer[y][x].ch != tui->frontbuffer[y][x].ch ||
                 tui->backbuffer[y][x].attr != tui->frontbuffer[y][x].attr) {
-                int off = (y * TUI_COLS + x) * 2;
-                _farpokeb(DOS_SCREEN_SEG, off, tui->backbuffer[y][x].ch);
-                _farpokeb(DOS_SCREEN_SEG, off + 1, tui->backbuffer[y][x].attr);
+                unsigned long off = (unsigned long)((y * TUI_COLS + x) * 2);
+                uint16_t cell = (uint16_t)tui->backbuffer[y][x].ch |
+                                ((uint16_t)tui->backbuffer[y][x].attr << 8);
+                _farnspokew(off, cell);
                 tui->frontbuffer[y][x] = tui->backbuffer[y][x];
             }
         }
     }
 #else
+    int cur_y = -1;
+    int cur_x = -1;
+    int cur_attr = -1;
+    int any_written = 0;
     for (int y = 0; y < TUI_ROWS; y++) {
         for (int x = 0; x < TUI_COLS; x++) {
             if (tui->backbuffer[y][x].ch != tui->frontbuffer[y][x].ch ||
                 tui->backbuffer[y][x].attr != tui->frontbuffer[y][x].attr) {
                 uint8_t attr = tui->backbuffer[y][x].attr;
-                uint8_t fg = attr & 0x0F;
-                uint8_t bg = (attr >> 4) & 0x07;
-                printf("\033[%d;%dH\033[%d;%dm", y + 1, x + 1,
-                       30 + (fg % 8) + (fg >= 8 ? 60 : 0),
-                       40 + bg);
+                if (y != cur_y || x != cur_x) {
+                    printf("\033[%d;%dH", y + 1, x + 1);
+                }
+                if ((int)attr != cur_attr) {
+                    uint8_t fg = attr & 0x0F;
+                    uint8_t bg = (attr >> 4) & 0x07;
+                    printf("\033[%d;%dm",
+                           30 + (fg % 8) + (fg >= 8 ? 60 : 0),
+                           40 + bg);
+                    cur_attr = (int)attr;
+                }
                 if (g_is_utf8) {
                     tui_print_cell_utf8(tui->backbuffer[y][x].ch);
                 } else {
                     putchar(tui->backbuffer[y][x].ch);
                 }
                 tui->frontbuffer[y][x] = tui->backbuffer[y][x];
+                cur_y = y;
+                cur_x = x + 1;
+                any_written = 1;
             }
         }
     }
-    fflush(stdout);
+    if (any_written) {
+        fflush(stdout);
+    }
 #endif
 }
 
@@ -435,7 +454,7 @@ int tui_poll_key(void) {
         unsigned char ch;
         if (read(STDIN_FILENO, &ch, 1) == 1) {
             if (ch == 27) {
-                struct timeval esc_tv = { 0, 25000 };
+                struct timeval esc_tv = { 0, 10000 };
                 fd_set esc_fds;
                 FD_ZERO(&esc_fds);
                 FD_SET(STDIN_FILENO, &esc_fds);

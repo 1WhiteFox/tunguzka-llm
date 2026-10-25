@@ -270,7 +270,9 @@ int    tunguzka_load_stream(TunguzkaModel *model, const char *model_path, uint32
                             ComputeBackend backend, int use_kv8, int force_stream, size_t max_ram_bytes);
 int    tunguzka_load_from_offset(TunguzkaModel *model, const char *file_path, size_t base_offset, size_t slice_size,
                                  uint32_t override_max_seq, ComputeBackend backend, int use_kv8, int force_stream, size_t max_ram_bytes);
+int    tunguzka_reconfigure(TunguzkaModel *model, uint32_t new_max_seq, int new_use_kv8);
 int    tunguzka_shift_kv_cache(TunguzkaModel *model, int cur_pos, int shift);
+float *tunguzka_forward_ex(TunguzkaModel *model, int token, int pos, int compute_logits);
 float *tunguzka_forward(TunguzkaModel *model, int token, int pos);
 void   tunguzka_free(TunguzkaModel *model);
 

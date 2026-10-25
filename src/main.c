@@ -249,8 +249,17 @@ static int byte_category(unsigned char b) {
     if (b == '\n' || b == '\r') return 1;
     if (b == ' ' || b == '\t')  return 2;
     if (b >= '0' && b <= '9')   return 3;
+    if (b == 0xC2 || b == 0xE2) return 5;
     if ((b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || b >= 0x80) return 4;
     return 5;
+}
+
+static unsigned char last_lead_byte(const char *s, size_t len) {
+    size_t idx = len - 1;
+    while (idx > 0 && ((unsigned char)s[idx] & 0xC0) == 0x80 && (len - idx) < 4) {
+        idx--;
+    }
+    return (unsigned char)s[idx];
 }
 
 static int can_bpe_merge_bytelevel(const char *s1, const char *s2) {
@@ -259,7 +268,11 @@ static int can_bpe_merge_bytelevel(const char *s1, const char *s2) {
     unsigned char f1 = (unsigned char)s1[0];
     unsigned char e1 = (unsigned char)s1[l1 - 1];
     unsigned char f2 = (unsigned char)s2[0];
-    int c_e1 = byte_category(e1);
+    if ((f2 & 0xC0) == 0x80 && e1 >= 0x80) {
+        return 1;
+    }
+    unsigned char lead_e1 = last_lead_byte(s1, l1);
+    int c_e1 = byte_category(lead_e1);
     int c_f2 = byte_category(f2);
     if (c_e1 == 1 || c_f2 == 1) return (c_e1 == 1 && c_f2 == 1);
     if (c_f2 == 2) return (c_e1 == 2);
@@ -877,7 +890,14 @@ static void tui_render_screen(TuiEngine *tui, TunguzkaModel *model, const char *
     tui->backbuffer[20][0].ch = 0xC3;
     for (int i = 1; i < 79; i++) tui->backbuffer[20][i].ch = 0xC4;
     tui->backbuffer[20][79].ch = 0xB4;
-    tui_printf(tui, 2, 21, TUI_ATTR_USER, "> %s_", input_buf);
+    const char *vis_input = input_buf;
+    while (*vis_input && tui_utf8_cols(vis_input) > 72) {
+        vis_input++;
+        while ((*vis_input & 0xC0) == 0x80) vis_input++;
+    }
+    tui_printf(tui, 2, 21, TUI_ATTR_USER, "> %s_", vis_input);
+    tui->backbuffer[21][79].ch = 0xB3;
+    tui->backbuffer[21][79].attr = TUI_ATTR_BORDER;
 
     tui->backbuffer[22][0].ch = 0xC3;
     for (int i = 1; i < 79; i++) tui->backbuffer[22][i].ch = 0xC4;
@@ -1082,11 +1102,13 @@ static void run_tui_session(TunguzkaModel *model, const char *init_model_path, s
             model->backend = cycle_valid_backend(model->backend);
         } else if (key == TUI_KEY_F3) {
             int new_kv8 = !model->use_kv8;
-            int cur_stream = model->stream_mode;
             uint32_t cur_ctx = model->config.max_seq_len;
-            ComputeBackend cur_b = model->backend;
-            tunguzka_free(model);
-            tunguzka_load_from_offset(model, active_model_path, base_offset, slice_size, cur_ctx, cur_b, new_kv8, cur_stream, max_ram_bytes);
+            if (tunguzka_reconfigure(model, cur_ctx, new_kv8) != 0) {
+                int cur_stream = model->stream_mode;
+                ComputeBackend cur_b = model->backend;
+                tunguzka_free(model);
+                tunguzka_load_from_offset(model, active_model_path, base_offset, slice_size, cur_ctx, cur_b, new_kv8, cur_stream, max_ram_bytes);
+            }
             pos = 0;
             recent_cnt = 0;
         } else if (key == TUI_KEY_F4) {
@@ -1108,10 +1130,12 @@ static void run_tui_session(TunguzkaModel *model, const char *init_model_path, s
             if (next_ctx > max_hw_ctx) next_ctx = 64;
             if (next_ctx > max_hw_ctx) next_ctx = max_hw_ctx;
             int cur_kv8 = model->use_kv8;
-            int cur_stream = model->stream_mode;
-            ComputeBackend cur_b = model->backend;
-            tunguzka_free(model);
-            tunguzka_load_from_offset(model, active_model_path, base_offset, slice_size, next_ctx, cur_b, cur_kv8, cur_stream, max_ram_bytes);
+            if (tunguzka_reconfigure(model, next_ctx, cur_kv8) != 0) {
+                int cur_stream = model->stream_mode;
+                ComputeBackend cur_b = model->backend;
+                tunguzka_free(model);
+                tunguzka_load_from_offset(model, active_model_path, base_offset, slice_size, next_ctx, cur_b, cur_kv8, cur_stream, max_ram_bytes);
+            }
             steps = calc_tui_steps_for_ctx(model->config.max_seq_len, (int)model->config.max_seq_len / 2);
             pos = 0;
             recent_cnt = 0;
@@ -1195,9 +1219,13 @@ static void run_tui_session(TunguzkaModel *model, const char *init_model_path, s
             int token = prompt_tokens[0];
             int next = 0;
             float t_start = get_time_ms();
+            float t_last_ui = t_start;
             float step0_chk = 0.0f;
             int generated = 0;
             char tail_window[128] = {0};
+
+            tui_render_screen(&tui, model, input_buf, pos, temp, top_k, top_p, rep_pen,
+                              0, steps, last_tps, last_ms, last_chk, modal_open, modal_sel);
 
             for (int p_idx = 0; generated < steps; p_idx++) {
                 if (pos >= (int)model->config.max_seq_len) {
@@ -1206,13 +1234,15 @@ static void run_tui_session(TunguzkaModel *model, const char *init_model_path, s
                     pos = tunguzka_shift_kv_cache(model, pos, shift);
                 }
 
-                float *logits = tunguzka_forward(model, token, pos);
+                int need_logits = (p_idx == 0 || p_idx >= num_p - 1);
+                float *logits = tunguzka_forward_ex(model, token, pos, need_logits);
                 pos++;
 
                 if (p_idx == 0) {
                     for (uint32_t i = 0; i < model->config.vocab_size; i++) {
                         step0_chk += logits[i] * (float)((int)(i % 7) - 3);
                     }
+                    last_chk = step0_chk;
                 }
 
                 if (token < 128000) {
@@ -1221,6 +1251,18 @@ static void run_tui_session(TunguzkaModel *model, const char *init_model_path, s
 
                 if (p_idx < num_p - 1) {
                     token = prompt_tokens[p_idx + 1];
+                    float now_ms = get_time_ms();
+                    if (now_ms - t_last_ui >= 40.0f) {
+                        float dt = now_ms - t_start;
+                        last_tps = (dt > 0.0f) ? ((float)(p_idx + 1) * 1000.0f / dt) : 0.0f;
+                        last_ms  = (dt > 0.0f) ? (dt / (float)(p_idx + 1)) : 0.0f;
+                        tui_render_screen(&tui, model, input_buf, pos, temp, top_k, top_p, rep_pen,
+                                          0, steps, last_tps, last_ms, last_chk, modal_open, modal_sel);
+                        t_last_ui = now_ms;
+                        if (tui_poll_key() == TUI_KEY_ESC) {
+                            break;
+                        }
+                    }
                     continue;
                 }
 
@@ -1230,7 +1272,7 @@ static void run_tui_session(TunguzkaModel *model, const char *init_model_path, s
                 if (next == 1 || next == 2 || (next >= 128001 && next <= 128009)) {
                     int stop_tok = (model->config.vocab_size >= 100000) ? 128009 : 2;
                     if (pos < (int)model->config.max_seq_len) {
-                        tunguzka_forward(model, stop_tok, pos);
+                        tunguzka_forward_ex(model, stop_tok, pos, 0);
                         pos++;
                     }
                     break;
@@ -1248,21 +1290,25 @@ static void run_tui_session(TunguzkaModel *model, const char *init_model_path, s
                 if (check_stop_sequence(tail_window, sizeof(tail_window), piece, is_qa_wrapped)) {
                     int stop_tok = (model->config.vocab_size >= 100000) ? 128009 : 2;
                     if (pos < (int)model->config.max_seq_len) {
-                        tunguzka_forward(model, stop_tok, pos);
+                        tunguzka_forward_ex(model, stop_tok, pos, 0);
                         pos++;
                     }
                     break;
                 }
 
                 chat_append_piece(piece, &resp_cols);
-                float dt = get_time_ms() - t_start;
+                float now_ms = get_time_ms();
+                float dt = now_ms - t_start;
                 last_tps = (dt > 0.0f) ? ((float)(p_idx + 1) * 1000.0f / dt) : 0.0f;
                 last_ms  = (dt > 0.0f) ? (dt / (float)(p_idx + 1)) : 0.0f;
                 last_gen = generated;
                 last_chk = step0_chk;
 
-                tui_render_screen(&tui, model, input_buf, pos, temp, top_k, top_p, rep_pen,
-                                  last_gen, steps, last_tps, last_ms, last_chk, modal_open, modal_sel);
+                if (generated == 1 || generated >= steps || now_ms - t_last_ui >= 30.0f) {
+                    tui_render_screen(&tui, model, input_buf, pos, temp, top_k, top_p, rep_pen,
+                                      last_gen, steps, last_tps, last_ms, last_chk, modal_open, modal_sel);
+                    t_last_ui = now_ms;
+                }
 
                 int abort_key = tui_poll_key();
                 if (abort_key == TUI_KEY_ESC) {
@@ -1274,6 +1320,24 @@ static void run_tui_session(TunguzkaModel *model, const char *init_model_path, s
         } else if (key >= 32 && key < 256 && input_len < (int)sizeof(input_buf) - 5) {
             input_buf[input_len++] = (char)key;
             input_buf[input_len] = '\0';
+            while (input_len < (int)sizeof(input_buf) - 5) {
+                int next_k = tui_poll_key();
+                if (next_k >= 32 && next_k < 256) {
+                    input_buf[input_len++] = (char)next_k;
+                    input_buf[input_len] = '\0';
+                } else if (next_k == '\b' || next_k == 127) {
+                    if (input_len > 0) {
+                        while (input_len > 0 && ((unsigned char)input_buf[input_len - 1] & 0xC0) == 0x80) {
+                            input_buf[--input_len] = '\0';
+                        }
+                        if (input_len > 0) {
+                            input_buf[--input_len] = '\0';
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
         }
         tui_render_screen(&tui, model, input_buf, pos, temp, top_k, top_p, rep_pen,
                           last_gen, steps, last_tps, last_ms, last_chk, modal_open, modal_sel);
@@ -1513,7 +1577,8 @@ int main(int argc, char **argv) {
             pos = tunguzka_shift_kv_cache(&model, pos, shift);
         }
 
-        float *logits = tunguzka_forward(&model, token, pos);
+        int need_logits = (step == 0 || step >= num_prompt_tokens - 1);
+        float *logits = tunguzka_forward_ex(&model, token, pos, need_logits);
         pos++;
         total_forwards++;
 
